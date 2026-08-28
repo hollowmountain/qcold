@@ -39,6 +39,17 @@ CREATE TABLE IF NOT EXISTS asked (
     PRIMARY KEY (chat_id, question_id)
 );
 
+-- как вопрос показывает себя в игре: база собрана из разных источников,
+-- и вопрос, в который никто никогда не попадает, скорее всего с неверным
+-- ключом, а не сложный
+CREATE TABLE IF NOT EXISTS qstats (
+    question_id INTEGER PRIMARY KEY,
+    shown       INTEGER NOT NULL DEFAULT 0,   -- сколько раз задавали
+    taps        INTEGER NOT NULL DEFAULT 0,   -- сколько всего нажатий
+    hits        INTEGER NOT NULL DEFAULT 0,   -- из них по правильному варианту
+    reports     INTEGER NOT NULL DEFAULT 0    -- сколько раз пожаловались
+);
+
 -- счёт за всё время, отдельно в каждом чате
 CREATE TABLE IF NOT EXISTS scores (
     chat_id  INTEGER NOT NULL,
@@ -145,6 +156,9 @@ def import_all():
             CONN.execute("""DELETE FROM asked WHERE question_id IN (
                                 SELECT id FROM questions
                                  WHERE question NOT IN (SELECT question FROM keep))""")
+            CONN.execute("""DELETE FROM qstats WHERE question_id IN (
+                                SELECT id FROM questions
+                                 WHERE question NOT IN (SELECT question FROM keep))""")
             gone = CONN.execute("""DELETE FROM questions
                                     WHERE question NOT IN
                                           (SELECT question FROM keep)""").rowcount
@@ -185,6 +199,43 @@ def pick(chat_id, n, chosen=None):
     return [{"id": r["id"], "pack": r["pack"], "topic": r["topic"],
              "question": r["question"], "correct": r["correct"],
              "wrong": json.loads(r["wrong"])} for r in cur]
+
+
+def record(question_id, taps, hits):
+    """Итог одного показа вопроса."""
+    with CONN:
+        CONN.execute(
+            """INSERT INTO qstats (question_id, shown, taps, hits)
+               VALUES (?, 1, ?, ?)
+               ON CONFLICT(question_id) DO UPDATE SET
+                   shown = qstats.shown + 1,
+                   taps  = qstats.taps + excluded.taps,
+                   hits  = qstats.hits + excluded.hits""",
+            (question_id, taps, hits))
+
+
+def report(question_id):
+    with CONN:
+        CONN.execute(
+            """INSERT INTO qstats (question_id, reports) VALUES (?, 1)
+               ON CONFLICT(question_id) DO UPDATE SET
+                   reports = qstats.reports + 1""", (question_id,))
+    return CONN.execute("SELECT reports FROM qstats WHERE question_id = ?",
+                        (question_id,)).fetchone()[0]
+
+
+def suspicious(limit=10, min_taps=8):
+    """Вопросы, на которые стоит посмотреть глазами: на них пожаловались
+    или в них почти никто не попадает при заметном числе нажатий."""
+    cur = CONN.execute(
+        """SELECT q.pack, q.question, q.correct, s.shown, s.taps, s.hits, s.reports
+             FROM qstats s JOIN questions q ON q.id = s.question_id
+            WHERE s.reports > 0 OR (s.taps >= ? AND s.hits * 8 <= s.taps)
+            ORDER BY s.reports DESC,
+                     CASE WHEN s.taps > 0 THEN s.hits * 1.0 / s.taps END ASC,
+                     s.taps DESC
+            LIMIT ?""", (min_taps, limit))
+    return [dict(r) for r in cur]
 
 
 def mark_asked(chat_id, question_ids):

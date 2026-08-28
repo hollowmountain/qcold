@@ -80,6 +80,9 @@ POINTS_TEXT = (" / ".join(map(str, POINTS[:-1])) + f", дальше по {POINTS
                if len(POINTS) > 1 else f"по {POINTS[0]} за верный ответ")
 
 LETTERS = "АБВГДЕЖЗИК"
+# Вариант длиннее этого телеграм обрежет в кнопке многоточием, и выбирать
+# станет не из чего. Такие вопросы печатаем списком, а кнопки делаем буквами.
+LONG_OPTION = 30
 MEDALS = ["🥇", "🥈", "🥉"]
 
 BOT_ID = None
@@ -94,6 +97,9 @@ games = {}
 
 # Начатые, но ещё не запущенные раунды: висит клавиатура выбора тем.
 pending = {}
+
+# Кто на какой вопрос уже жаловался -- чтобы одна кнопка не накручивала счёт.
+complained = set()
 
 esc = html.escape
 
@@ -244,6 +250,19 @@ def ask_packs(chat_id, user, total, thread):
         pending.pop(chat_id, None)
 
 
+def handle_report(cq, qid):
+    if not qid.isdigit():
+        answer(cq)
+        return
+    key = (cq["from"].get("id"), int(qid))
+    if key in complained:
+        answer(cq, "Уже отметил, спасибо")
+        return
+    complained.add(key)
+    n = db.report(int(qid))
+    answer(cq, f"Отметил. Жалоб на этот вопрос: {n}", alert=True)
+
+
 def handle_pick(cq, chat_id, what):
     p = pending.get(chat_id)
     if not p:
@@ -313,8 +332,10 @@ def send_question(chat_id, g):
     if not text.endswith(("?", "!", ".", ":")):
         text += "?"
     q = {
-        "seq": g["seq"], "text": text, "topic": item["topic"],
+        "seq": g["seq"], "id": item["id"], "text": text, "topic": item["topic"],
         "pack": item["pack"],
+        # длинные варианты не влезают в кнопку -- покажем их списком в тексте
+        "long": max(len(o) for o in options) > LONG_OPTION,
         "options": options, "correct": options.index(item["correct"]),
         # кто уже нажал -- и угадавшие, и выбывшие: второй попытки нет ни у кого
         "answered": set(), "msg_id": None,
@@ -345,15 +366,23 @@ def head(g, q):
 
 
 def body(g, q):
-    return (f"{head(g, q)}\n\n{esc(q['text'])}\n\n"
-            f"⏱ {QUESTION_SECONDS} с  ·  {POINTS_TEXT}")
+    parts = [head(g, q), "", esc(q["text"])]
+    if q["long"]:
+        parts += [""] + [f"{LETTERS[i]}. {esc(o)}"
+                         for i, o in enumerate(q["options"])]
+    parts += ["", f"⏱ {QUESTION_SECONDS} с  ·  {POINTS_TEXT}"]
+    return "\n".join(parts)
 
 
 def keyboard(q):
+    if q["long"]:
+        # текст вариантов уже в сообщении, на кнопках оставляем только буквы
+        buttons = [btn(LETTERS[i], f"a:{q['seq']}:{i}")
+                   for i in range(len(q["options"]))]
+        rows = [buttons[i:i + 4] for i in range(0, len(buttons), 4)]
+        return kb(rows)
     labels = [f"{LETTERS[i]}. {opt}" for i, opt in enumerate(q["options"])]
     buttons = [btn(t, f"a:{q['seq']}:{i}") for i, t in enumerate(labels)]
-    # длинные варианты телеграм ужимает до многоточия, поэтому в два столбца
-    # ставим только короткие -- иначе восемь кнопок читать невозможно
     per_row = 2 if max(len(t) for t in labels) <= 22 else 1
     return kb([buttons[i:i + per_row] for i in range(0, len(buttons), per_row)])
 
@@ -378,8 +407,12 @@ def close_question(chat_id, g):
                      f"{plural(n, 'ответ', 'ответа', 'ответов')} мимо")
     else:
         lines.append("🤷 Никто не ответил")
+    db.record(q["id"], len(q["answered"]), len(q["winners"]))
     if q["msg_id"]:
-        edit(chat_id, q["msg_id"], "\n".join(lines))
+        # кнопка жалобы остаётся на закрытом вопросе: заметить кривой ключ
+        # можно только когда увидел правильный ответ
+        edit(chat_id, q["msg_id"], "\n".join(lines),
+             kb([[btn("⚠️ Ошибка в вопросе", f"r:{q['id']}")]]))
     g["q"] = None
     g["next_at"] = time.time() + PAUSE_SECONDS
 
@@ -454,6 +487,7 @@ HELP = (
     f"{DEFAULT_QUESTIONS}, максимум {MAX_QUESTIONS}), темы выбираются кнопками\n"
     "<b>/quiz N тема тема</b> — сразу по темам, без кнопок\n"
     "<b>/themes</b> — какие есть темы\n"
+    "<b>/bad</b> — вопросы с подозрением на ошибку\n"
     "<b>/stop</b> — прервать раунд\n"
     "<b>/top</b> — таблица за всё время в этом чате\n"
     "<b>/reset</b> — обнулить таблицу чата (только админ)\n\n"
@@ -486,6 +520,22 @@ def cmd_quiz(chat_id, user, args, thread=None):
         start_round(chat_id, user, total, thread, chosen)
     else:
         ask_packs(chat_id, user, total, thread)
+
+
+def cmd_bad(chat_id, thread=None):
+    rows = db.suspicious()
+    if not rows:
+        send(chat_id, "Подозрительных вопросов нет. Жалобы ставятся кнопкой "
+                      "под закрытым вопросом.", thread=thread)
+        return
+    lines = ["🩺 <b>Вопросы, на которые стоит посмотреть</b>", ""]
+    for r in rows:
+        share = f"{r['hits']}/{r['taps']}" if r["taps"] else "нет нажатий"
+        mark = f"⚠️{r['reports']} " if r["reports"] else ""
+        lines.append(f"{mark}<b>{esc(r['pack'])}</b> · {esc(r['question'])}\n"
+                     f"   ответ: {esc(r['correct'])} · попаданий {share}")
+    lines += ["", "Правь файл в questions/ и перезапусти бота."]
+    send(chat_id, "\n".join(lines), thread=thread)
 
 
 def cmd_themes(chat_id, thread=None):
@@ -564,6 +614,8 @@ def handle_message(m):
         cmd_stop(chat_id, user, thread)
     elif cmd in ("themes", "topics", "temy"):
         cmd_themes(chat_id, thread)
+    elif cmd == "bad":
+        cmd_bad(chat_id, thread)
     elif cmd == "top":
         cmd_top(chat_id, thread)
     elif cmd == "reset":
@@ -584,6 +636,9 @@ def handle_callback(cq):
         return
     if data.startswith("p:"):
         handle_pick(cq, chat_id, data[2:])
+        return
+    if data.startswith("r:"):
+        handle_report(cq, data[2:])
         return
     if not data.startswith("a:"):
         answer(cq)
@@ -655,6 +710,7 @@ def main():
     api("setMyCommands", commands=[
         {"command": "quiz", "description": "начать викторину: /quiz 10"},
         {"command": "themes", "description": "какие есть темы"},
+        {"command": "bad", "description": "вопросы с подозрением на ошибку"},
         {"command": "stop", "description": "прервать раунд"},
         {"command": "top", "description": "таблица чата за всё время"},
         {"command": "help", "description": "как это работает"},
