@@ -51,11 +51,34 @@ PAUSE_SECONDS = int(os.environ.get("QUIZ_PAUSE", 3))
 # Сколько вариантов показывать. Если у вопроса неверных меньше, покажем
 # столько, сколько есть, -- вопрос из-за этого не пропадёт.
 OPTIONS = int(os.environ.get("QUIZ_OPTIONS", 8))
-# Не чаще раза в столько секунд правим счётчик под вопросом: если нажали
-# разом пятеро, телеграм получит одну правку, а не пять.
-EDIT_THROTTLE = 1.5
+# Как часто перерисовывать таймер под вопросом. Чаще нельзя: телеграм
+# принимает в группу порядка 20 сообщений в минуту, и правки идут в тот же
+# счёт. Вопрос с паузой занимает 18 секунд, то есть примерно 6 обращений
+# на вопрос: одно на само сообщение, одно на итог, остальные -- отсчёт.
+# Четыре секунды дают три перерисовки и оставляют запас.
+REFRESH_SECONDS = float(os.environ.get("QUIZ_REFRESH", 4))
 DEFAULT_QUESTIONS = 10
 MAX_QUESTIONS = 50
+
+
+def _points():
+    """Баллы за место: первый угадавший берёт 5, второй 3, третий 2, все
+    остальные по 1. Разрыв между первым и вторым намеренно крупный -- будь
+    он в один балл, торопиться было бы незачем."""
+    raw = os.environ.get("QUIZ_POINTS", "5,3,2,1")
+    try:
+        vals = [int(x) for x in raw.split(",") if x.strip()]
+    except ValueError:
+        vals = []
+    if not vals or min(vals) < 0:
+        sys.exit(f"QUIZ_POINTS не разобрать: {raw!r}. Нужен список "
+                 f"неотрицательных чисел через запятую, например 5,3,2,1")
+    return vals
+
+
+POINTS = _points()
+POINTS_TEXT = (" / ".join(map(str, POINTS[:-1])) + f", дальше по {POINTS[-1]}"
+               if len(POINTS) > 1 else f"по {POINTS[0]} за верный ответ")
 
 LETTERS = "АБВГДЕЖЗИК"
 MEDALS = ["🥇", "🥈", "🥉"]
@@ -145,11 +168,18 @@ def plural(n, one="вопрос", few="вопроса", many="вопросов")
 
 
 def secs(ms):
-    return f"{ms / 1000:.1f} с"
+    """До миллисекунды: время ответа бот и так меряет именно в них."""
+    return f"{ms / 1000:.3f} с".replace(".", ",")
 
 
 def avg(times):
     return sum(times) / len(times) if times else float("inf")
+
+
+def award(place):
+    """Сколько баллов за это место. Кто не попал в список, получает столько
+    же, сколько последний в нём."""
+    return POINTS[min(place, len(POINTS)) - 1]
 
 
 # --- ход раунда ------------------------------------------------------------
@@ -170,7 +200,7 @@ def start_round(chat_id, user, total, thread=None):
     }
     send(chat_id,
          f"🎯 <b>Викторина: {total} {plural(total)}</b>\n\n"
-         f"Балл забирает тот, кто первым нажмёт правильную кнопку. "
+         f"Отвечают все, но кто раньше — тому больше: {POINTS_TEXT}.\n"
          f"Ошибся — этот вопрос для тебя закрыт, так что не тыкай наугад.\n"
          f"На каждый вопрос {QUESTION_SECONDS} секунд.\n\n"
          f"Начали.", thread=thread)
@@ -194,7 +224,12 @@ def send_question(chat_id, g):
         "seq": g["seq"], "text": text, "topic": item["topic"],
         "options": options, "correct": options.index(item["correct"]),
         # кто уже нажал -- и угадавшие, и выбывшие: второй попытки нет ни у кого
-        "answered": set(), "msg_id": None, "dirty": False,
+        "answered": set(), "msg_id": None,
+        # угадавшие по порядку: от него и считаются места
+        "winners": [],
+        # уточним после отправки, но отрисовать таймер надо уже сейчас
+        "started": time.time(), "last_edit": time.time(),
+        "deadline": time.time() + QUESTION_SECONDS,
     }
     r = send(chat_id, body(g, q), keyboard(q), g["thread"])
     if not r.get("ok"):
@@ -215,9 +250,16 @@ def head(g, q):
             f"<i>{esc(q['topic'])}</i>")
 
 
+BAR_CELLS = 10
+
+
 def body(g, q):
+    left = max(0.0, q["deadline"] - time.time())
+    full = int(round(BAR_CELLS * left / QUESTION_SECONDS))
+    bar = "▰" * full + "▱" * (BAR_CELLS - full)
     return (f"{head(g, q)}\n\n{esc(q['text'])}\n\n"
-            f"⏱ {QUESTION_SECONDS} с  ·  ответили: {len(q['answered'])}")
+            f"⏱ {math.ceil(left)} с  {bar}  ·  "
+            f"ответили: {len(q['answered'])}")
 
 
 def keyboard(q):
@@ -229,32 +271,43 @@ def keyboard(q):
     return kb([buttons[i:i + per_row] for i in range(0, len(buttons), per_row)])
 
 
-def refresh_counter(chat_id, g):
-    """Перерисовать счётчик ответивших. Клавиатуру передаём заново: без неё
+def refresh(chat_id, g):
+    """Перерисовать таймер и счётчик. Клавиатуру передаём заново: без неё
     editMessageText снял бы кнопки прямо посреди вопроса."""
     q = g["q"]
-    q["dirty"] = False
     q["last_edit"] = time.time()
-    if q["msg_id"]:
-        edit(chat_id, q["msg_id"], body(g, q), keyboard(q))
+    if not q["msg_id"]:
+        return
+    r = edit(chat_id, q["msg_id"], body(g, q), keyboard(q))
+    # 429 -- уперлись в лимит правок. Отодвигаем следующую попытку ровно на
+    # столько, сколько просит телеграм, вместо того чтобы долбиться дальше
+    if not r.get("ok") and r.get("error_code") == 429:
+        wait = (r.get("parameters") or {}).get("retry_after", 5)
+        q["last_edit"] = time.time() + wait
 
 
-def close_question(chat_id, g, winner=None, ms=None):
-    """Убирает кнопки, показывает верный вариант и ставит паузу до следующего."""
+def close_question(chat_id, g):
+    """Убирает кнопки, показывает верный вариант и кто какое место занял."""
     q = g["q"]
-    n = len(q["answered"])
     right = f"{LETTERS[q['correct']]}. {esc(q['options'][q['correct']])}"
-    if winner:
-        tail = f"✅ <b>{esc(winner['name'])}</b> +1 балл  ·  {secs(ms)}"
-    elif n:
-        tail = (f"🤷 Никто не угадал  ·  {n} "
-                f"{plural(n, 'ответ', 'ответа', 'ответов')} мимо")
+    lines = [head(g, q), "", esc(q["text"]), "", f"Ответ: <b>{right}</b>", ""]
+    if q["winners"]:
+        for w in q["winners"]:
+            mark = (MEDALS[w["place"] - 1] if w["place"] <= len(MEDALS)
+                    else f"{w['place']}.")
+            lines.append(f"{mark} <b>{esc(w['name'])}</b> +{w['gain']}"
+                         f"  ·  {secs(w['ms'])}")
+        missed = len(q["answered"]) - len(q["winners"])
+        if missed:
+            lines.append(f"мимо: {missed}")
+    elif q["answered"]:
+        n = len(q["answered"])
+        lines.append(f"🤷 Никто не угадал  ·  {n} "
+                     f"{plural(n, 'ответ', 'ответа', 'ответов')} мимо")
     else:
-        tail = "🤷 Никто не ответил"
+        lines.append("🤷 Никто не ответил")
     if q["msg_id"]:
-        edit(chat_id, q["msg_id"],
-             f"{head(g, q)}\n\n{esc(q['text'])}\n\n"
-             f"Ответ: <b>{right}</b>\n{tail}")
+        edit(chat_id, q["msg_id"], "\n".join(lines))
     g["q"] = None
     g["next_at"] = time.time() + PAUSE_SECONDS
 
@@ -266,6 +319,7 @@ def results_table(g):
         mark = MEDALS[i] if i < len(MEDALS) else f"{i + 1}."
         lines.append(f"{mark} <b>{esc(p['name'])}</b> — {p['points']} "
                      f"{plural(p['points'], 'балл', 'балла', 'баллов')}"
+                     f"  ·  {len(p['times'])} из {g['asked']}"
                      f"  ·  в среднем {secs(avg(p['times']))}")
     fastest = min(rows, key=lambda p: min(p["times"]))
     lines += ["", f"⚡ Самый быстрый ответ: <b>{esc(fastest['name'])}</b>, "
@@ -294,8 +348,11 @@ def tick():
             q = g["q"]
             if now >= q["deadline"]:
                 close_question(chat_id, g)
-            elif q["dirty"] and now >= q["last_edit"] + EDIT_THROTTLE:
-                refresh_counter(chat_id, g)
+            elif (now >= q["last_edit"] + REFRESH_SECONDS
+                  and q["deadline"] - now > 1):
+                # у самого дедлайна не перерисовываем: следом всё равно
+                # придёт правка с ответом, и она будет точнее
+                refresh(chat_id, g)
         elif now >= g["next_at"]:
             if g["asked"] >= g["total"] or not g["queue"]:
                 finish_round(chat_id, g)
@@ -314,8 +371,7 @@ def poll_timeout():
             stamps.append(g["next_at"])
             continue
         stamps.append(q["deadline"])
-        if q["dirty"]:
-            stamps.append(q["last_edit"] + EDIT_THROTTLE)
+        stamps.append(q["last_edit"] + REFRESH_SECONDS)
     return max(1, min(30, math.ceil(min(stamps) - time.time())))
 
 
@@ -327,12 +383,13 @@ HELP = (
     "<b>/stop</b> — прервать раунд\n"
     "<b>/top</b> — таблица за всё время в этом чате\n"
     "<b>/reset</b> — обнулить таблицу чата (только админ)\n\n"
-    f"У вопроса {OPTIONS} вариантов и {QUESTION_SECONDS} секунд. Балл берёт "
-    "тот, кто первым нажал правильную кнопку. Ответил неверно — на этом "
-    "вопросе выбываешь, перебирать варианты бессмысленно.\n\n"
-    "Под вопросом видно, сколько человек уже ответили. Вопрос закрывается "
-    "первым правильным ответом или по истечении таймера — чтобы успеть "
-    "нажать мог каждый.\n\n"
+    f"У вопроса {OPTIONS} вариантов и {QUESTION_SECONDS} секунд. Отвечают "
+    f"все, но баллы зависят от того, кто раньше: {POINTS_TEXT}. Ответил "
+    "неверно — на этом вопросе выбываешь, перебирать варианты бессмысленно."
+    "\n\n"
+    "Под вопросом тикает обратный отсчёт и счётчик ответивших. Кто именно "
+    "угадал, до конца не видно: иначе поздние ответы шли бы по подсказке. "
+    "Вопрос висит все свои секунды, успеть может каждый.\n\n"
     "В конце раунда — у кого сколько баллов и кто отвечал быстрее всех."
 )
 
@@ -452,20 +509,23 @@ def handle_callback(cq):
     q["answered"].add(uid)
     if idx != q["correct"]:
         answer(cq, "Мимо. Этот вопрос для тебя закрыт.", alert=True)
-        q["dirty"] = True
         # Вопрос при этом НЕ закрываем: остальные ещё не нажимали. Закрывать
         # его "когда ответили все" нельзя -- бот не знает, кто в чате играет,
         # а кто просто читает. Любая оценка состава ошибается в меньшую
         # сторону и отбирает ход у тех, кто не успел.
         return
 
-    p = g["players"].setdefault(uid, {"name": display_name(user),
-                                      "points": 0, "times": []})
-    p["name"] = display_name(user)      # мог сменить имя между раундами
-    p["points"] += 1
+    place = len(q["winners"]) + 1
+    gain = award(place)
+    name = display_name(user)
+    q["winners"].append({"name": name, "ms": ms, "place": place, "gain": gain})
+    p = g["players"].setdefault(uid, {"name": name, "points": 0, "times": []})
+    p["name"] = name                    # мог сменить имя между раундами
+    p["points"] += gain
     p["times"].append(ms)
-    answer(cq, f"Верно! +1 балл, {secs(ms)}")
-    close_question(chat_id, g, winner=p, ms=ms)
+    # вопрос не закрываем: у остальных ещё есть время занять своё место
+    answer(cq, f"Верно! {place}-е место, +{gain} "
+               f"{plural(gain, 'балл', 'балла', 'баллов')}  ·  {secs(ms)}")
 
 
 def drop_pending():
