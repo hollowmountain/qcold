@@ -1,10 +1,12 @@
 """Хранилище викторины: вопросы, история показов и счёт по чатам.
 
-Источник правды для вопросов -- questions.csv: его удобно править руками
-и смотреть диффом. При каждом старте csv заливается в sqlite. Sqlite нужен
-не ради вопросов, а ради двух вещей, которые в питоне вышли бы неудобно:
-выбрать случайные вопросы, которые в этом чате давно не задавали, и хранить
-накопленный счёт между перезапусками.
+Источник правды для вопросов -- папка questions/: один csv на тему, имя
+файла и есть её название. Такие файлы удобно править руками и смотреть
+диффом, а добавить тему -- значит просто положить рядом ещё один файл.
+
+Sqlite нужен не ради самих вопросов, а ради двух вещей, которые в питоне
+вышли бы неудобно: выбрать случайные вопросы, которые в этом чате давно не
+задавали, и хранить накопленный счёт между перезапусками.
 """
 import csv
 import json
@@ -17,11 +19,12 @@ HERE = Path(__file__).parent
 # На сервере файловая система часто временная -- пусть путь к базе можно
 # будет увести на диск переменной окружения, не трогая код.
 DB_PATH = Path(os.environ.get("DATA_DIR", HERE)) / "quiz.db"
-CSV_PATH = HERE / "questions.csv"
+QUESTIONS_DIR = HERE / "questions"
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS questions (
     id       INTEGER PRIMARY KEY,
+    pack     TEXT NOT NULL DEFAULT 'общая',   -- тема, она же имя файла
     topic    TEXT NOT NULL,
     question TEXT NOT NULL UNIQUE,
     correct  TEXT NOT NULL,
@@ -43,12 +46,14 @@ CREATE TABLE IF NOT EXISTS scores (
     name     TEXT    NOT NULL,
     points   INTEGER NOT NULL DEFAULT 0,
     rounds   INTEGER NOT NULL DEFAULT 0,
-    answers  INTEGER NOT NULL DEFAULT 0,   -- правильных ответов (= баллов)
+    answers  INTEGER NOT NULL DEFAULT 0,   -- верных ответов
     total_ms INTEGER NOT NULL DEFAULT 0,   -- суммарное время этих ответов
     best_ms  INTEGER,
     PRIMARY KEY (chat_id, user_id)
 );
 """
+
+CONN = None
 
 
 def connect():
@@ -58,26 +63,24 @@ def connect():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    # база могла остаться с прошлой версии, когда тем ещё не было
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(questions)")}
+    if "pack" not in cols:
+        conn.execute("ALTER TABLE questions ADD COLUMN pack TEXT "
+                     "NOT NULL DEFAULT 'общая'")
+        conn.commit()
     return conn
 
 
-CONN = None
-
-
 def init():
-    """Открыть базу и залить в неё questions.csv."""
+    """Открыть базу и залить в неё все файлы из questions/."""
     global CONN
     CONN = connect()
-    return import_csv(CSV_PATH)
+    return import_all()
 
 
-def import_csv(path):
-    """Заливает csv в таблицу вопросов. Ключ -- текст вопроса: если вопрос
-    поправили в файле, обновится строка, а не появится дубль. Возвращает,
-    сколько вопросов теперь в базе."""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(f"нет файла с вопросами: {path}")
+def _read(path, pack):
+    """Разбирает один файл темы. Возвращает строки для вставки."""
     rows = []
     with path.open(encoding="utf-8-sig", newline="") as f:
         reader = csv.DictReader(f, delimiter=";")
@@ -105,33 +108,48 @@ def import_csv(path):
             if not wrong:
                 print(f"{path.name}:{i} -- нет неверных вариантов, вопрос пропущен")
                 continue
-            rows.append((row.get("topic", "разное").strip(),
+            rows.append((pack, row.get("topic", pack).strip() or pack,
                          row["question"].strip(), correct,
                          json.dumps(wrong, ensure_ascii=False)))
+    return rows
+
+
+def import_all():
+    """Заливает все темы в базу. Ключ -- текст вопроса: поправленный вопрос
+    обновляет строку, а не плодит дубль. Возвращает, сколько вопросов в базе."""
+    files = sorted(QUESTIONS_DIR.glob("*.csv"))
+    if not files:
+        raise FileNotFoundError(f"нет ни одного файла с вопросами в {QUESTIONS_DIR}")
+    rows = []
+    for path in files:
+        rows.extend(_read(path, path.stem))
     with CONN:
         CONN.executemany(
-            """INSERT INTO questions (topic, question, correct, wrong)
-               VALUES (?, ?, ?, ?)
+            """INSERT INTO questions (pack, topic, question, correct, wrong)
+               VALUES (?, ?, ?, ?, ?)
                ON CONFLICT(question) DO UPDATE SET
+                   pack = excluded.pack,
                    topic = excluded.topic,
                    correct = excluded.correct,
                    wrong = excluded.wrong""", rows)
-        # Вопрос, пропавший из файла, надо убрать и из базы: иначе выброшенный
-        # или переименованный живёт в ней вечно и продолжает выпадать людям.
-        # Через временную таблицу, а не через IN (?, ?, ...): списком
-        # параметров можно упереться в лимит sqlite на большом файле.
+        # Вопрос, пропавший из файлов, надо убрать и из базы: иначе
+        # выброшенный или переименованный живёт в ней вечно и продолжает
+        # выпадать людям. Через временную таблицу, а не через IN (?, ?, ...):
+        # списком параметров можно упереться в лимит sqlite.
         if rows:
-            CONN.execute("CREATE TEMP TABLE IF NOT EXISTS keep (question TEXT PRIMARY KEY)")
+            CONN.execute("CREATE TEMP TABLE IF NOT EXISTS keep "
+                         "(question TEXT PRIMARY KEY)")
             CONN.execute("DELETE FROM keep")
             CONN.executemany("INSERT OR IGNORE INTO keep VALUES (?)",
-                             [(r[1],) for r in rows])
+                             [(r[2],) for r in rows])
             CONN.execute("""DELETE FROM asked WHERE question_id IN (
                                 SELECT id FROM questions
                                  WHERE question NOT IN (SELECT question FROM keep))""")
             gone = CONN.execute("""DELETE FROM questions
-                                    WHERE question NOT IN (SELECT question FROM keep)""").rowcount
+                                    WHERE question NOT IN
+                                          (SELECT question FROM keep)""").rowcount
             if gone:
-                print(f"{path.name}: убрано вопросов, которых больше нет в файле: {gone}")
+                print(f"убрано вопросов, которых больше нет в файлах: {gone}")
     return count()
 
 
@@ -139,19 +157,34 @@ def count():
     return CONN.execute("SELECT COUNT(*) FROM questions").fetchone()[0]
 
 
-def pick(chat_id, n):
+def packs():
+    """Темы и сколько в каждой вопросов, по убыванию размера."""
+    cur = CONN.execute("""SELECT pack, COUNT(*) AS n FROM questions
+                           GROUP BY pack ORDER BY n DESC, pack""")
+    return [(r["pack"], r["n"]) for r in cur]
+
+
+def pick(chat_id, n, chosen=None):
     """n вопросов для чата: сначала те, которых тут ещё не было, потом самые
     давние. Внутри одного дня порядок случайный, иначе после первого круга
-    вопросы шли бы всегда в одной и той же последовательности."""
+    вопросы шли бы всегда в одной и той же последовательности.
+
+    chosen -- список тем; пустой или None означает «все темы»."""
+    where, params = "", [chat_id]
+    if chosen:
+        where = " WHERE q.pack IN (%s)" % ",".join("?" * len(chosen))
+        params += list(chosen)
+    params.append(n)
     cur = CONN.execute(
-        """SELECT q.id, q.topic, q.question, q.correct, q.wrong
-             FROM questions q
-             LEFT JOIN asked a ON a.question_id = q.id AND a.chat_id = ?
-            ORDER BY COALESCE(a.at, 0) / 86400, RANDOM()
-            LIMIT ?""", (chat_id, n))
-    return [{"id": r["id"], "topic": r["topic"], "question": r["question"],
-             "correct": r["correct"], "wrong": json.loads(r["wrong"])}
-            for r in cur]
+        f"""SELECT q.id, q.pack, q.topic, q.question, q.correct, q.wrong
+              FROM questions q
+              LEFT JOIN asked a ON a.question_id = q.id AND a.chat_id = ?
+              {where}
+             ORDER BY COALESCE(a.at, 0) / 86400, RANDOM()
+             LIMIT ?""", params)
+    return [{"id": r["id"], "pack": r["pack"], "topic": r["topic"],
+             "question": r["question"], "correct": r["correct"],
+             "wrong": json.loads(r["wrong"])} for r in cur]
 
 
 def mark_asked(chat_id, question_ids):

@@ -85,9 +85,15 @@ MEDALS = ["🥇", "🥈", "🥉"]
 BOT_ID = None
 BOT_NAME = ""
 
+# Сколько секунд ждём, пока в чате выберут темы и нажмут «Поехали».
+PICK_SECONDS = 120
+
 # Идущие раунды: chat_id -> состояние. В памяти, а не в базе: раунд живёт
 # минуты, и переживать перезапуск ему незачем.
 games = {}
+
+# Начатые, но ещё не запущенные раунды: висит клавиатура выбора тем.
+pending = {}
 
 esc = html.escape
 
@@ -181,12 +187,93 @@ def award(place):
     return POINTS[min(place, len(POINTS)) - 1]
 
 
-# --- ход раунда ------------------------------------------------------------
-def start_round(chat_id, user, total, thread=None):
-    items = db.pick(chat_id, total)
-    if not items:
-        send(chat_id, "В базе нет ни одного вопроса. Проверь questions.csv.",
+# --- выбор тем -------------------------------------------------------------
+def match_packs(words, names):
+    """Тему можно назвать началом слова: «мар» найдёт «маркарян». Возвращает
+    что распознали и что нет."""
+    chosen, unknown = [], []
+    for w in words:
+        low = w.lower()
+        hit = ([n for n in names if n.lower() == low]
+               or [n for n in names if n.lower().startswith(low)])
+        if len(hit) == 1:
+            if hit[0] not in chosen:
+                chosen.append(hit[0])
+        else:
+            # ноль совпадений или несколько -- в обоих случаях человеку
+            # надо сказать, что именно не понято
+            unknown.append(w)
+    return chosen, unknown
+
+
+def picker_text(p):
+    if p["picked"]:
+        n = len(p["picked"])
+        tail = f"выбрано: {n} {plural(n, 'тема', 'темы', 'тем')}"
+    else:
+        tail = "ничего не отмечено — «Поехали» возьмёт все темы"
+    return (f"🎯 <b>Викторина: {p['total']} {plural(p['total'])}</b>\n\n"
+            f"Отметь темы — можно несколько.\n{tail}")
+
+
+def picker_kb(p):
+    buttons = []
+    for i, (name, cnt) in enumerate(p["packs"]):
+        mark = "✅ " if i in p["picked"] else ""
+        buttons.append(btn(f"{mark}{name} ({cnt})", f"p:{i}"))
+    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
+    rows.append([btn("🎲 Все темы", "p:all")])
+    rows.append([btn("▶️ Поехали", "p:go")])
+    return kb(rows)
+
+
+def ask_packs(chat_id, user, total, thread):
+    """Список тем снимаем один раз и держим в самом выборе: тогда индексы
+    в кнопках не разъедутся, даже если базу успеют перечитать."""
+    p = {"total": total, "picked": set(), "thread": thread, "msg_id": None,
+         "packs": db.packs(), "at": time.time()}
+    if not p["packs"]:
+        send(chat_id, "В базе нет ни одной темы. Проверь папку questions.",
              thread=thread)
+        return
+    pending[chat_id] = p
+    r = send(chat_id, picker_text(p), picker_kb(p), thread)
+    if r.get("ok"):
+        p["msg_id"] = r["result"]["message_id"]
+    else:
+        pending.pop(chat_id, None)
+
+
+def handle_pick(cq, chat_id, what):
+    p = pending.get(chat_id)
+    if not p:
+        answer(cq, "Этот выбор уже неактуален")
+        return
+    if what == "go":
+        chosen = [p["packs"][i][0] for i in sorted(p["picked"])]
+        pending.pop(chat_id, None)
+        answer(cq)
+        start_round(chat_id, cq["from"], p["total"], p["thread"], chosen,
+                    p["msg_id"])
+        return
+    if what == "all":
+        # повторное нажатие снимает всё -- иначе выбор нечем сбросить
+        full = set(range(len(p["packs"])))
+        p["picked"] = set() if p["picked"] == full else full
+    elif what.isdigit() and int(what) < len(p["packs"]):
+        p["picked"] ^= {int(what)}
+    answer(cq)
+    # правку клавиатуры здесь себе позволяем: в отличие от вопроса, тут
+    # потерянное нажатие стоит одного повторного тыка, а не балла
+    if p["msg_id"]:
+        edit(chat_id, p["msg_id"], picker_text(p), picker_kb(p))
+
+
+# --- ход раунда ------------------------------------------------------------
+def start_round(chat_id, user, total, thread=None, chosen=None, msg_id=None):
+    items = db.pick(chat_id, total, chosen)
+    if not items:
+        send(chat_id, "По этим темам вопросов не нашлось.", thread=thread)
         return
     if len(items) < total:
         send(chat_id, f"В базе всего {len(items)} {plural(len(items))} — "
@@ -197,12 +284,18 @@ def start_round(chat_id, user, total, thread=None):
         "seq": 0, "q": None, "next_at": time.time() + 2, "players": {},
         "thread": thread,
     }
-    send(chat_id,
-         f"🎯 <b>Викторина: {total} {plural(total)}</b>\n\n"
-         f"Отвечают все, но кто раньше — тому больше: {POINTS_TEXT}.\n"
-         f"Ошибся — этот вопрос для тебя закрыт, так что не тыкай наугад.\n"
-         f"На каждый вопрос {QUESTION_SECONDS} секунд.\n\n"
-         f"Начали.", thread=thread)
+    where = ", ".join(chosen) if chosen else "все темы"
+    intro = (f"🎯 <b>Викторина: {total} {plural(total)}</b>\n"
+             f"📚 {esc(where)}\n\n"
+             f"Отвечают все, но кто раньше — тому больше: {POINTS_TEXT}.\n"
+             f"Ошибся — этот вопрос для тебя закрыт, так что не тыкай наугад.\n"
+             f"На каждый вопрос {QUESTION_SECONDS} секунд.\n\n"
+             f"Начали.")
+    # если раунд запустили кнопкой, объявление пишем прямо поверх выбора тем
+    if msg_id:
+        edit(chat_id, msg_id, intro)
+    else:
+        send(chat_id, intro, thread=thread)
 
 
 def send_question(chat_id, g):
@@ -221,6 +314,7 @@ def send_question(chat_id, g):
         text += "?"
     q = {
         "seq": g["seq"], "text": text, "topic": item["topic"],
+        "pack": item["pack"],
         "options": options, "correct": options.index(item["correct"]),
         # кто уже нажал -- и угадавшие, и выбывшие: второй попытки нет ни у кого
         "answered": set(), "msg_id": None,
@@ -244,8 +338,10 @@ def send_question(chat_id, g):
 
 
 def head(g, q):
+    # в однотемных паках topic совпадает с названием темы -- не дублируем
+    label = q["topic"] if q["topic"] == q["pack"] else f"{q['pack']} · {q['topic']}"
     return (f"<b>Вопрос {g['asked']} из {g['total']}</b>  ·  "
-            f"<i>{esc(q['topic'])}</i>")
+            f"<i>{esc(label)}</i>")
 
 
 def body(g, q):
@@ -319,6 +415,12 @@ def tick():
     """Двигает раунды по времени: закрывает просроченные вопросы и задаёт
     следующие. Вызывается из главного цикла перед каждым getUpdates."""
     now = time.time()
+    for chat_id, p in list(pending.items()):
+        if now >= p["at"] + PICK_SECONDS:
+            pending.pop(chat_id, None)
+            if p["msg_id"]:
+                edit(chat_id, p["msg_id"],
+                     "Выбор тем отменён: никто не нажал «Поехали».")
     for chat_id, g in list(games.items()):
         if g["q"]:
             q = g["q"]
@@ -333,9 +435,9 @@ def tick():
 
 def poll_timeout():
     """Долго ждать обновления можно только пока никого не поджимает таймер."""
-    if not games:
+    if not games and not pending:
         return 30
-    stamps = []
+    stamps = [p["at"] + PICK_SECONDS for p in pending.values()]
     for g in games.values():
         q = g["q"]
         if not q:
@@ -349,7 +451,9 @@ def poll_timeout():
 HELP = (
     "🎯 <b>qcold</b> — викторина для групп.\n\n"
     "<b>/quiz N</b> — раунд из N вопросов (по умолчанию "
-    f"{DEFAULT_QUESTIONS}, максимум {MAX_QUESTIONS})\n"
+    f"{DEFAULT_QUESTIONS}, максимум {MAX_QUESTIONS}), темы выбираются кнопками\n"
+    "<b>/quiz N тема тема</b> — сразу по темам, без кнопок\n"
+    "<b>/themes</b> — какие есть темы\n"
     "<b>/stop</b> — прервать раунд\n"
     "<b>/top</b> — таблица за всё время в этом чате\n"
     "<b>/reset</b> — обнулить таблицу чата (только админ)\n\n"
@@ -368,17 +472,37 @@ def cmd_quiz(chat_id, user, args, thread=None):
     if chat_id in games:
         send(chat_id, "Раунд уже идёт. /stop — если надо прервать.", thread=thread)
         return
+    rest = list(args)
     total = DEFAULT_QUESTIONS
-    if args:
-        if not args[0].lstrip("+").isdigit():
-            send(chat_id, "Сколько вопросов? Например: <code>/quiz 10</code>",
-                 thread=thread)
-            return
-        total = max(1, min(MAX_QUESTIONS, int(args[0])))
-    start_round(chat_id, user, total, thread)
+    if rest and rest[0].lstrip("+").isdigit():
+        total = max(1, min(MAX_QUESTIONS, int(rest.pop(0))))
+    chosen, unknown = match_packs(rest, [n for n, _ in db.packs()])
+    if unknown:
+        send(chat_id, f"Не понял «{esc(unknown[0])}». Так: "
+                      f"<code>/quiz 10 аниме кс</code>, а /themes покажет список.",
+             thread=thread)
+        return
+    if chosen:
+        start_round(chat_id, user, total, thread, chosen)
+    else:
+        ask_packs(chat_id, user, total, thread)
+
+
+def cmd_themes(chat_id, thread=None):
+    rows = db.packs()
+    lines = ["📚 <b>Темы</b>", ""]
+    for name, cnt in rows:
+        lines.append(f"• {esc(name)} — {cnt} {plural(cnt)}")
+    lines += ["", "<code>/quiz 10 аниме кс</code> — сразу по темам",
+              "<code>/quiz 10</code> — выбрать кнопками"]
+    send(chat_id, "\n".join(lines), thread=thread)
 
 
 def cmd_stop(chat_id, user, thread=None):
+    if chat_id in pending and chat_id not in games:
+        pending.pop(chat_id)
+        send(chat_id, "Выбор темы отменён.", thread=thread)
+        return
     g = games.get(chat_id)
     if not g:
         send(chat_id, "Сейчас ничего не идёт.", thread=thread)
@@ -438,6 +562,8 @@ def handle_message(m):
         cmd_quiz(chat_id, user, args, thread)
     elif cmd == "stop":
         cmd_stop(chat_id, user, thread)
+    elif cmd in ("themes", "topics", "temy"):
+        cmd_themes(chat_id, thread)
     elif cmd == "top":
         cmd_top(chat_id, thread)
     elif cmd == "reset":
@@ -453,7 +579,13 @@ def handle_callback(cq):
     data = cq.get("data") or ""
     chat = (cq.get("message") or {}).get("chat") or {}
     chat_id = chat.get("id")
-    if chat_id is None or not data.startswith("a:"):
+    if chat_id is None:
+        answer(cq)
+        return
+    if data.startswith("p:"):
+        handle_pick(cq, chat_id, data[2:])
+        return
+    if not data.startswith("a:"):
         answer(cq)
         return
     try:
@@ -522,6 +654,7 @@ def main():
     BOT_NAME = me["result"].get("username", "")
     api("setMyCommands", commands=[
         {"command": "quiz", "description": "начать викторину: /quiz 10"},
+        {"command": "themes", "description": "какие есть темы"},
         {"command": "stop", "description": "прервать раунд"},
         {"command": "top", "description": "таблица чата за всё время"},
         {"command": "help", "description": "как это работает"},
