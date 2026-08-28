@@ -52,6 +52,9 @@ CREATE TABLE IF NOT EXISTS scores (
 
 
 def connect():
+    # на Railway каталог тома появляется сам, но если DATA_DIR задали
+    # раньше, чем подключили том, пусть база всё равно откроется
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)

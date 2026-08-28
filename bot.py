@@ -400,6 +400,19 @@ def handle_callback(cq):
     close_question(chat_id, g, winner=p, ms=ms)
 
 
+def drop_pending():
+    """После перезапуска в очереди у телеграма висят команды и нажатия,
+    накопившиеся, пока бот лежал, -- в том числе от раунда, которого в памяти
+    уже нет. Проигрывать их заново незачем: забираем только последний апдейт
+    и продолжаем с него."""
+    r = api("getUpdates", offset=-1, timeout=0)
+    if r.get("ok") and r["result"]:
+        skipped = r["result"][-1]["update_id"]
+        print("пропущены накопившиеся апдейты по", skipped, "включительно")
+        return skipped + 1
+    return None
+
+
 def main():
     global BOT_ID, BOT_NAME
     total = db.init()
@@ -417,7 +430,7 @@ def main():
     ])
     print(f"бот запущен: @{BOT_NAME}, вопросов в базе: {total}")
 
-    offset = None
+    offset = drop_pending()
     while True:
         tick()
         upd = api("getUpdates", offset=offset, timeout=poll_timeout())
