@@ -51,12 +51,11 @@ PAUSE_SECONDS = int(os.environ.get("QUIZ_PAUSE", 3))
 # Сколько вариантов показывать. Если у вопроса неверных меньше, покажем
 # столько, сколько есть, -- вопрос из-за этого не пропадёт.
 OPTIONS = int(os.environ.get("QUIZ_OPTIONS", 8))
-# Как часто перерисовывать таймер под вопросом. Чаще нельзя: телеграм
-# принимает в группу порядка 20 сообщений в минуту, и правки идут в тот же
-# счёт. Вопрос с паузой занимает 18 секунд, то есть примерно 6 обращений
-# на вопрос: одно на само сообщение, одно на итог, остальные -- отсчёт.
-# Четыре секунды дают три перерисовки и оставляют запас.
-REFRESH_SECONDS = float(os.environ.get("QUIZ_REFRESH", 4))
+# Сообщение с вопросом не правится, пока кнопки живые: правка заставляет
+# клиент перерисовать клавиатуру, и нажатие, попавшее в этот момент,
+# пропадает -- человеку приходится тыкать второй раз. Поэтому ни живого
+# отсчёта, ни живого счётчика под вопросом нет: единственная правка
+# приходит уже вместе с ответом, когда нажимать больше нечего.
 DEFAULT_QUESTIONS = 10
 MAX_QUESTIONS = 50
 
@@ -227,8 +226,8 @@ def send_question(chat_id, g):
         "answered": set(), "msg_id": None,
         # угадавшие по порядку: от него и считаются места
         "winners": [],
-        # уточним после отправки, но отрисовать таймер надо уже сейчас
-        "started": time.time(), "last_edit": time.time(),
+        # уточним после отправки
+        "started": time.time(),
         "deadline": time.time() + QUESTION_SECONDS,
     }
     r = send(chat_id, body(g, q), keyboard(q), g["thread"])
@@ -240,7 +239,6 @@ def send_question(chat_id, g):
     # время считаем от момента, когда сообщение реально ушло, иначе в счёт
     # скорости попадёт задержка сети
     q["started"] = time.time()
-    q["last_edit"] = q["started"]
     q["deadline"] = q["started"] + QUESTION_SECONDS
     g["q"] = q
 
@@ -250,16 +248,9 @@ def head(g, q):
             f"<i>{esc(q['topic'])}</i>")
 
 
-BAR_CELLS = 10
-
-
 def body(g, q):
-    left = max(0.0, q["deadline"] - time.time())
-    full = int(round(BAR_CELLS * left / QUESTION_SECONDS))
-    bar = "▰" * full + "▱" * (BAR_CELLS - full)
     return (f"{head(g, q)}\n\n{esc(q['text'])}\n\n"
-            f"⏱ {math.ceil(left)} с  {bar}  ·  "
-            f"ответили: {len(q['answered'])}")
+            f"⏱ {QUESTION_SECONDS} с  ·  {POINTS_TEXT}")
 
 
 def keyboard(q):
@@ -269,21 +260,6 @@ def keyboard(q):
     # ставим только короткие -- иначе восемь кнопок читать невозможно
     per_row = 2 if max(len(t) for t in labels) <= 22 else 1
     return kb([buttons[i:i + per_row] for i in range(0, len(buttons), per_row)])
-
-
-def refresh(chat_id, g):
-    """Перерисовать таймер и счётчик. Клавиатуру передаём заново: без неё
-    editMessageText снял бы кнопки прямо посреди вопроса."""
-    q = g["q"]
-    q["last_edit"] = time.time()
-    if not q["msg_id"]:
-        return
-    r = edit(chat_id, q["msg_id"], body(g, q), keyboard(q))
-    # 429 -- уперлись в лимит правок. Отодвигаем следующую попытку ровно на
-    # столько, сколько просит телеграм, вместо того чтобы долбиться дальше
-    if not r.get("ok") and r.get("error_code") == 429:
-        wait = (r.get("parameters") or {}).get("retry_after", 5)
-        q["last_edit"] = time.time() + wait
 
 
 def close_question(chat_id, g):
@@ -348,11 +324,6 @@ def tick():
             q = g["q"]
             if now >= q["deadline"]:
                 close_question(chat_id, g)
-            elif (now >= q["last_edit"] + REFRESH_SECONDS
-                  and q["deadline"] - now > 1):
-                # у самого дедлайна не перерисовываем: следом всё равно
-                # придёт правка с ответом, и она будет точнее
-                refresh(chat_id, g)
         elif now >= g["next_at"]:
             if g["asked"] >= g["total"] or not g["queue"]:
                 finish_round(chat_id, g)
@@ -371,7 +342,6 @@ def poll_timeout():
             stamps.append(g["next_at"])
             continue
         stamps.append(q["deadline"])
-        stamps.append(q["last_edit"] + REFRESH_SECONDS)
     return max(1, min(30, math.ceil(min(stamps) - time.time())))
 
 
@@ -387,9 +357,9 @@ HELP = (
     f"все, но баллы зависят от того, кто раньше: {POINTS_TEXT}. Ответил "
     "неверно — на этом вопросе выбываешь, перебирать варианты бессмысленно."
     "\n\n"
-    "Под вопросом тикает обратный отсчёт и счётчик ответивших. Кто именно "
-    "угадал, до конца не видно: иначе поздние ответы шли бы по подсказке. "
-    "Вопрос висит все свои секунды, успеть может каждый.\n\n"
+    "Пока идёт вопрос, бот его сообщение не трогает: любая правка "
+    "перерисовывает кнопки, и нажатие в этот момент пропадает. Поэтому кто "
+    "сколько взял, видно только когда вопрос закрылся.\n\n"
     "В конце раунда — у кого сколько баллов и кто отвечал быстрее всех."
 )
 
