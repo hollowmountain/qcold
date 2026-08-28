@@ -166,7 +166,7 @@ def start_round(chat_id, user, total, thread=None):
     games[chat_id] = {
         "total": total, "asked": 0, "queue": items, "starter": user.get("id"),
         "seq": 0, "q": None, "next_at": time.time() + 2, "players": {},
-        "thread": thread, "roster": set(),
+        "thread": thread,
     }
     send(chat_id,
          f"🎯 <b>Викторина: {total} {plural(total)}</b>\n\n"
@@ -195,9 +195,6 @@ def send_question(chat_id, g):
         "options": options, "correct": options.index(item["correct"]),
         # кто уже нажал -- и угадавшие, и выбывшие: второй попытки нет ни у кого
         "answered": set(), "msg_id": None, "dirty": False,
-        # состав играющих на момент вопроса. Снимок, а не живой набор: иначе
-        # на первом вопросе первый же нажавший закрыл бы вопрос сам себе
-        "roster": set(g["roster"]),
     }
     r = send(chat_id, body(g, q), keyboard(q), g["thread"])
     if not r.get("ok"):
@@ -242,17 +239,16 @@ def refresh_counter(chat_id, g):
         edit(chat_id, q["msg_id"], body(g, q), keyboard(q))
 
 
-def close_question(chat_id, g, winner=None, ms=None, everyone=False):
+def close_question(chat_id, g, winner=None, ms=None):
     """Убирает кнопки, показывает верный вариант и ставит паузу до следующего."""
     q = g["q"]
     n = len(q["answered"])
     right = f"{LETTERS[q['correct']]}. {esc(q['options'][q['correct']])}"
     if winner:
         tail = f"✅ <b>{esc(winner['name'])}</b> +1 балл  ·  {secs(ms)}"
-    elif everyone:
-        tail = f"🤷 Все {n} {plural(n, 'ответ', 'ответа', 'ответов')} мимо"
     elif n:
-        tail = f"🤷 Никто не угадал  ·  ответили: {n}"
+        tail = (f"🤷 Никто не угадал  ·  {n} "
+                f"{plural(n, 'ответ', 'ответа', 'ответов')} мимо")
     else:
         tail = "🤷 Никто не ответил"
     if q["msg_id"]:
@@ -334,8 +330,9 @@ HELP = (
     f"У вопроса {OPTIONS} вариантов и {QUESTION_SECONDS} секунд. Балл берёт "
     "тот, кто первым нажал правильную кнопку. Ответил неверно — на этом "
     "вопросе выбываешь, перебирать варианты бессмысленно.\n\n"
-    "Под вопросом видно, сколько человек уже ответили: как только "
-    "отстрелялись все, кто играет, бот не досиживает таймер и идёт дальше. "
+    "Под вопросом видно, сколько человек уже ответили. Вопрос закрывается "
+    "первым правильным ответом или по истечении таймера — чтобы успеть "
+    "нажать мог каждый.\n\n"
     "В конце раунда — у кого сколько баллов и кто отвечал быстрее всех."
 )
 
@@ -453,13 +450,13 @@ def handle_callback(cq):
         return
     ms = int((time.time() - q["started"]) * 1000)
     q["answered"].add(uid)
-    g["roster"].add(uid)
     if idx != q["correct"]:
         answer(cq, "Мимо. Этот вопрос для тебя закрыт.", alert=True)
         q["dirty"] = True
-        # все, кто играет, уже отстрелялись -- досиживать таймер незачем
-        if q["roster"] and q["roster"] <= q["answered"]:
-            close_question(chat_id, g, everyone=True)
+        # Вопрос при этом НЕ закрываем: остальные ещё не нажимали. Закрывать
+        # его "когда ответили все" нельзя -- бот не знает, кто в чате играет,
+        # а кто просто читает. Любая оценка состава ошибается в меньшую
+        # сторону и отбирает ход у тех, кто не успел.
         return
 
     p = g["players"].setdefault(uid, {"name": display_name(user),
