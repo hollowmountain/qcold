@@ -45,13 +45,19 @@ TOKEN = _token()
 API = f"https://api.telegram.org/bot{TOKEN}"
 
 # Сколько секунд висит вопрос, если никто не ответил.
-QUESTION_SECONDS = int(os.environ.get("QUIZ_SECONDS", 30))
+QUESTION_SECONDS = int(os.environ.get("QUIZ_SECONDS", 15))
 # Пауза между вопросами -- чтобы успели прочитать, кто взял балл.
 PAUSE_SECONDS = int(os.environ.get("QUIZ_PAUSE", 3))
+# Сколько вариантов показывать. Если у вопроса неверных меньше, покажем
+# столько, сколько есть, -- вопрос из-за этого не пропадёт.
+OPTIONS = int(os.environ.get("QUIZ_OPTIONS", 8))
+# Не чаще раза в столько секунд правим счётчик под вопросом: если нажали
+# разом пятеро, телеграм получит одну правку, а не пять.
+EDIT_THROTTLE = 1.5
 DEFAULT_QUESTIONS = 10
 MAX_QUESTIONS = 50
 
-LETTERS = "АБВГДЕ"
+LETTERS = "АБВГДЕЖЗИК"
 MEDALS = ["🥇", "🥈", "🥉"]
 
 BOT_ID = None
@@ -92,9 +98,11 @@ def kb(rows):
     return {"inline_keyboard": rows}
 
 
-def send(chat_id, text, markup=None):
-    return api("sendMessage", chat_id=chat_id, text=text,
-               parse_mode="HTML", reply_markup=markup)
+def send(chat_id, text, markup=None, thread=None):
+    # в форумных супергруппах ответ надо класть в ту же тему, откуда пришла
+    # команда, иначе бот отвечает в General мимо всех
+    return api("sendMessage", chat_id=chat_id, text=text, parse_mode="HTML",
+               reply_markup=markup, message_thread_id=thread)
 
 
 def edit(chat_id, msg_id, text, markup=None):
@@ -145,30 +153,35 @@ def avg(times):
 
 
 # --- ход раунда ------------------------------------------------------------
-def start_round(chat_id, user, total):
+def start_round(chat_id, user, total, thread=None):
     items = db.pick(chat_id, total)
     if not items:
-        send(chat_id, "В базе нет ни одного вопроса. Проверь questions.csv.")
+        send(chat_id, "В базе нет ни одного вопроса. Проверь questions.csv.",
+             thread=thread)
         return
     if len(items) < total:
         send(chat_id, f"В базе всего {len(items)} {plural(len(items))} — "
-                      f"столько и сыграем.")
+                      f"столько и сыграем.", thread=thread)
         total = len(items)
     games[chat_id] = {
         "total": total, "asked": 0, "queue": items, "starter": user.get("id"),
         "seq": 0, "q": None, "next_at": time.time() + 2, "players": {},
+        "thread": thread, "roster": set(),
     }
     send(chat_id,
          f"🎯 <b>Викторина: {total} {plural(total)}</b>\n\n"
          f"Балл забирает тот, кто первым нажмёт правильную кнопку. "
          f"Ошибся — этот вопрос для тебя закрыт, так что не тыкай наугад.\n"
          f"На каждый вопрос {QUESTION_SECONDS} секунд.\n\n"
-         f"Начали.")
+         f"Начали.", thread=thread)
 
 
 def send_question(chat_id, g):
     item = g["queue"].pop(0)
-    options = [item["correct"]] + item["wrong"]
+    wrong = item["wrong"]
+    if len(wrong) > OPTIONS - 1:
+        wrong = random.sample(wrong, OPTIONS - 1)
+    options = [item["correct"]] + wrong
     random.shuffle(options)
     g["asked"] += 1
     g["seq"] += 1
@@ -180,11 +193,13 @@ def send_question(chat_id, g):
     q = {
         "seq": g["seq"], "text": text, "topic": item["topic"],
         "options": options, "correct": options.index(item["correct"]),
-        "blocked": set(), "msg_id": None,
+        # кто уже нажал -- и угадавшие, и выбывшие: второй попытки нет ни у кого
+        "answered": set(), "msg_id": None, "dirty": False,
+        # состав играющих на момент вопроса. Снимок, а не живой набор: иначе
+        # на первом вопросе первый же нажавший закрыл бы вопрос сам себе
+        "roster": set(g["roster"]),
     }
-    markup = kb([[btn(f"{LETTERS[i]}. {opt}", f"a:{q['seq']}:{i}")]
-                 for i, opt in enumerate(options)])
-    r = send(chat_id, head(g, q) + "\n\n" + esc(text), markup)
+    r = send(chat_id, body(g, q), keyboard(q), g["thread"])
     if not r.get("ok"):
         # не отправилось -- не подвешиваем раунд, пробуем следующий вопрос
         g["next_at"] = time.time() + PAUSE_SECONDS
@@ -193,6 +208,7 @@ def send_question(chat_id, g):
     # время считаем от момента, когда сообщение реально ушло, иначе в счёт
     # скорости попадёт задержка сети
     q["started"] = time.time()
+    q["last_edit"] = q["started"]
     q["deadline"] = q["started"] + QUESTION_SECONDS
     g["q"] = q
 
@@ -202,12 +218,41 @@ def head(g, q):
             f"<i>{esc(q['topic'])}</i>")
 
 
-def close_question(chat_id, g, winner=None, ms=None):
+def body(g, q):
+    return (f"{head(g, q)}\n\n{esc(q['text'])}\n\n"
+            f"⏱ {QUESTION_SECONDS} с  ·  ответили: {len(q['answered'])}")
+
+
+def keyboard(q):
+    labels = [f"{LETTERS[i]}. {opt}" for i, opt in enumerate(q["options"])]
+    buttons = [btn(t, f"a:{q['seq']}:{i}") for i, t in enumerate(labels)]
+    # длинные варианты телеграм ужимает до многоточия, поэтому в два столбца
+    # ставим только короткие -- иначе восемь кнопок читать невозможно
+    per_row = 2 if max(len(t) for t in labels) <= 22 else 1
+    return kb([buttons[i:i + per_row] for i in range(0, len(buttons), per_row)])
+
+
+def refresh_counter(chat_id, g):
+    """Перерисовать счётчик ответивших. Клавиатуру передаём заново: без неё
+    editMessageText снял бы кнопки прямо посреди вопроса."""
+    q = g["q"]
+    q["dirty"] = False
+    q["last_edit"] = time.time()
+    if q["msg_id"]:
+        edit(chat_id, q["msg_id"], body(g, q), keyboard(q))
+
+
+def close_question(chat_id, g, winner=None, ms=None, everyone=False):
     """Убирает кнопки, показывает верный вариант и ставит паузу до следующего."""
     q = g["q"]
+    n = len(q["answered"])
     right = f"{LETTERS[q['correct']]}. {esc(q['options'][q['correct']])}"
     if winner:
         tail = f"✅ <b>{esc(winner['name'])}</b> +1 балл  ·  {secs(ms)}"
+    elif everyone:
+        tail = f"🤷 Все {n} {plural(n, 'ответ', 'ответа', 'ответов')} мимо"
+    elif n:
+        tail = f"🤷 Никто не угадал  ·  ответили: {n}"
     else:
         tail = "🤷 Никто не ответил"
     if q["msg_id"]:
@@ -237,10 +282,11 @@ def results_table(g):
 def finish_round(chat_id, g):
     games.pop(chat_id, None)
     if not g["players"]:
-        send(chat_id, "🏁 Раунд окончен, но никто так и не ответил.")
+        send(chat_id, "🏁 Раунд окончен, но никто так и не ответил.",
+             thread=g["thread"])
         return
     db.save_round(chat_id, g["players"])
-    send(chat_id, results_table(g))
+    send(chat_id, results_table(g), thread=g["thread"])
 
 
 def tick():
@@ -249,8 +295,11 @@ def tick():
     now = time.time()
     for chat_id, g in list(games.items()):
         if g["q"]:
-            if now >= g["q"]["deadline"]:
+            q = g["q"]
+            if now >= q["deadline"]:
                 close_question(chat_id, g)
+            elif q["dirty"] and now >= q["last_edit"] + EDIT_THROTTLE:
+                refresh_counter(chat_id, g)
         elif now >= g["next_at"]:
             if g["asked"] >= g["total"] or not g["queue"]:
                 finish_round(chat_id, g)
@@ -262,9 +311,16 @@ def poll_timeout():
     """Долго ждать обновления можно только пока никого не поджимает таймер."""
     if not games:
         return 30
-    nearest = min(g["q"]["deadline"] if g["q"] else g["next_at"]
-                  for g in games.values())
-    return max(1, min(30, math.ceil(nearest - time.time())))
+    stamps = []
+    for g in games.values():
+        q = g["q"]
+        if not q:
+            stamps.append(g["next_at"])
+            continue
+        stamps.append(q["deadline"])
+        if q["dirty"]:
+            stamps.append(q["last_edit"] + EDIT_THROTTLE)
+    return max(1, min(30, math.ceil(min(stamps) - time.time())))
 
 
 # --- обработка апдейтов ----------------------------------------------------
@@ -275,44 +331,49 @@ HELP = (
     "<b>/stop</b> — прервать раунд\n"
     "<b>/top</b> — таблица за всё время в этом чате\n"
     "<b>/reset</b> — обнулить таблицу чата (только админ)\n\n"
-    "Балл получает тот, кто первым нажал правильную кнопку. "
-    "Ответил неверно — на этом вопросе выбываешь, перебирать варианты "
-    "бессмысленно. В конце раунда бот показывает, у кого сколько баллов "
-    "и кто отвечал быстрее всех."
+    f"У вопроса {OPTIONS} вариантов и {QUESTION_SECONDS} секунд. Балл берёт "
+    "тот, кто первым нажал правильную кнопку. Ответил неверно — на этом "
+    "вопросе выбываешь, перебирать варианты бессмысленно.\n\n"
+    "Под вопросом видно, сколько человек уже ответили: как только "
+    "отстрелялись все, кто играет, бот не досиживает таймер и идёт дальше. "
+    "В конце раунда — у кого сколько баллов и кто отвечал быстрее всех."
 )
 
 
-def cmd_quiz(chat_id, user, args):
+def cmd_quiz(chat_id, user, args, thread=None):
     if chat_id in games:
-        send(chat_id, "Раунд уже идёт. /stop — если надо прервать.")
+        send(chat_id, "Раунд уже идёт. /stop — если надо прервать.", thread=thread)
         return
     total = DEFAULT_QUESTIONS
     if args:
         if not args[0].lstrip("+").isdigit():
-            send(chat_id, "Сколько вопросов? Например: <code>/quiz 10</code>")
+            send(chat_id, "Сколько вопросов? Например: <code>/quiz 10</code>",
+                 thread=thread)
             return
         total = max(1, min(MAX_QUESTIONS, int(args[0])))
-    start_round(chat_id, user, total)
+    start_round(chat_id, user, total, thread)
 
 
-def cmd_stop(chat_id, user):
+def cmd_stop(chat_id, user, thread=None):
     g = games.get(chat_id)
     if not g:
-        send(chat_id, "Сейчас ничего не идёт.")
+        send(chat_id, "Сейчас ничего не идёт.", thread=thread)
         return
     if user.get("id") != g["starter"] and not is_admin(chat_id, user.get("id")):
-        send(chat_id, "Прервать раунд может тот, кто его начал, или админ чата.")
+        send(chat_id, "Прервать раунд может тот, кто его начал, или админ чата.",
+             thread=thread)
         return
     if g["q"] and g["q"]["msg_id"]:
         close_question(chat_id, g)
-    send(chat_id, "⏹ Раунд прерван.")
+    send(chat_id, "⏹ Раунд прерван.", thread=g["thread"])
     finish_round(chat_id, g)
 
 
-def cmd_top(chat_id):
+def cmd_top(chat_id, thread=None):
     rows = db.top(chat_id)
     if not rows:
-        send(chat_id, "Здесь ещё никто не набрал ни балла. /quiz 10 — и начнём.")
+        send(chat_id, "Здесь ещё никто не набрал ни балла. /quiz 10 — и начнём.",
+             thread=thread)
         return
     lines = ["🏆 <b>Таблица чата за всё время</b>", ""]
     for i, r in enumerate(rows):
@@ -326,13 +387,17 @@ def cmd_top(chat_id):
     if best:
         lines += ["", f"⚡ Рекорд скорости: <b>{esc(best['name'])}</b>, "
                       f"{secs(best['best_ms'])}"]
-    send(chat_id, "\n".join(lines))
+    send(chat_id, "\n".join(lines), thread=thread)
 
 
 def handle_message(m):
     chat_id = m["chat"]["id"]
+    # message_thread_id приходит и вне форумов, но валидной темой он является
+    # только при is_topic_message -- иначе телеграм ответит
+    # "message thread not found" и сообщение не дойдёт
+    thread = m.get("message_thread_id") if m.get("is_topic_message") else None
     if any(u.get("id") == BOT_ID for u in m.get("new_chat_members", [])):
-        send(chat_id, HELP)
+        send(chat_id, HELP, thread=thread)
         return
     text = (m.get("text") or "").strip()
     if not text.startswith("/"):
@@ -344,19 +409,20 @@ def handle_message(m):
     user = m.get("from") or {}
 
     if cmd in ("start", "help"):
-        send(chat_id, HELP)
+        send(chat_id, HELP, thread=thread)
     elif cmd == "quiz":
-        cmd_quiz(chat_id, user, args)
+        cmd_quiz(chat_id, user, args, thread)
     elif cmd == "stop":
-        cmd_stop(chat_id, user)
+        cmd_stop(chat_id, user, thread)
     elif cmd == "top":
-        cmd_top(chat_id)
+        cmd_top(chat_id, thread)
     elif cmd == "reset":
         if is_admin(chat_id, user.get("id")):
             db.reset(chat_id)
-            send(chat_id, "Таблица чата обнулена.")
+            send(chat_id, "Таблица чата обнулена.", thread=thread)
         else:
-            send(chat_id, "Обнулить таблицу может только админ чата.")
+            send(chat_id, "Обнулить таблицу может только админ чата.",
+                 thread=thread)
 
 
 def handle_callback(cq):
@@ -382,13 +448,18 @@ def handle_callback(cq):
 
     q, user = g["q"], cq["from"]
     uid = user.get("id")
-    if uid in q["blocked"]:
+    if uid in q["answered"]:
         answer(cq, "Ты уже ответил на этот вопрос")
         return
     ms = int((time.time() - q["started"]) * 1000)
+    q["answered"].add(uid)
+    g["roster"].add(uid)
     if idx != q["correct"]:
-        q["blocked"].add(uid)
         answer(cq, "Мимо. Этот вопрос для тебя закрыт.", alert=True)
+        q["dirty"] = True
+        # все, кто играет, уже отстрелялись -- досиживать таймер незачем
+        if q["roster"] and q["roster"] <= q["answered"]:
+            close_question(chat_id, g, everyone=True)
         return
 
     p = g["players"].setdefault(uid, {"name": display_name(user),

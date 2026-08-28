@@ -80,17 +80,33 @@ def import_csv(path):
         raise FileNotFoundError(f"нет файла с вопросами: {path}")
     rows = []
     with path.open(encoding="utf-8-sig", newline="") as f:
-        for i, row in enumerate(csv.DictReader(f, delimiter=";"), start=2):
+        reader = csv.DictReader(f, delimiter=";")
+        # колонок с неверными вариантами может быть сколько угодно:
+        # wrong1, wrong2, ... -- сколько дописали в файл, столько и берём
+        wrong_cols = sorted(
+            (c for c in (reader.fieldnames or []) if c and c.startswith("wrong")),
+            key=lambda c: int(c[5:]) if c[5:].isdigit() else 0)
+        for i, row in enumerate(reader, start=2):
             if not row.get("question") or not row.get("correct"):
                 continue
-            wrong = [row.get(k, "").strip() for k in ("wrong1", "wrong2", "wrong3")]
-            wrong = [w for w in wrong if w]
-            if len(wrong) < 1:
+            correct = row["correct"].strip()
+            wrong, seen = [], {correct}
+            for k in wrong_cols:
+                w = (row.get(k) or "").strip()
+                if not w:
+                    continue
+                # два одинаковых варианта в одном вопросе -- всегда опечатка,
+                # а совпавший с правильным сделал бы вопрос нечестным
+                if w in seen:
+                    print(f"{path.name}:{i} -- вариант «{w}» повторяется, пропущен")
+                    continue
+                seen.add(w)
+                wrong.append(w)
+            if not wrong:
                 print(f"{path.name}:{i} -- нет неверных вариантов, вопрос пропущен")
                 continue
             rows.append((row.get("topic", "разное").strip(),
-                         row["question"].strip(),
-                         row["correct"].strip(),
+                         row["question"].strip(), correct,
                          json.dumps(wrong, ensure_ascii=False)))
     with CONN:
         CONN.executemany(
@@ -100,6 +116,22 @@ def import_csv(path):
                    topic = excluded.topic,
                    correct = excluded.correct,
                    wrong = excluded.wrong""", rows)
+        # Вопрос, пропавший из файла, надо убрать и из базы: иначе выброшенный
+        # или переименованный живёт в ней вечно и продолжает выпадать людям.
+        # Через временную таблицу, а не через IN (?, ?, ...): списком
+        # параметров можно упереться в лимит sqlite на большом файле.
+        if rows:
+            CONN.execute("CREATE TEMP TABLE IF NOT EXISTS keep (question TEXT PRIMARY KEY)")
+            CONN.execute("DELETE FROM keep")
+            CONN.executemany("INSERT OR IGNORE INTO keep VALUES (?)",
+                             [(r[1],) for r in rows])
+            CONN.execute("""DELETE FROM asked WHERE question_id IN (
+                                SELECT id FROM questions
+                                 WHERE question NOT IN (SELECT question FROM keep))""")
+            gone = CONN.execute("""DELETE FROM questions
+                                    WHERE question NOT IN (SELECT question FROM keep)""").rowcount
+            if gone:
+                print(f"{path.name}: убрано вопросов, которых больше нет в файле: {gone}")
     return count()
 
 
