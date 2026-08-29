@@ -6,3 +6,6 @@ quiz.db
 
 __pycache__/
 *.pyc
+
+# локальная база, у каждой установки своя
+tests/quiz.db
